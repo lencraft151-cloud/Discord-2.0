@@ -21,6 +21,8 @@ Discord verbietet in seinen Nutzungsbedingungen inoffizielle Clients und automat
 ## Starten
 
 > **Neu hier?** Die [Schritt-für-Schritt-Anleitung](ANLEITUNG.md) erklärt alles: Discord-App anlegen, auf dem PC oder einem Server hosten und den Bot auf deinem Discord-Konto und deinen Servern einrichten.
+>
+> **Automatisch hosten:** Mit `.github/workflows/deploy.yml` spielt GitHub Actions jeden Push auf `main` als Docker-Container mit HTTPS auf deinen Server auf. Du musst nur ein paar Secrets eintragen ([Anleitung, Teil 2b](ANLEITUNG.md#teil-2b-automatisch-über-github-actions-empfohlen)).
 
 Du brauchst **Node.js 22.13 oder neuer** (die Datenbank nutzt das eingebaute `node:sqlite`).
 
@@ -103,6 +105,9 @@ server/
   discord-bridge.js  Discord-Bot (discord.js)
   discord-voice.js   Sprachverbindung des Bots (@discordjs/voice)
   discord-oauth.js   „Mit Discord anmelden“
+deploy/              Server-Dateien: docker-compose.yml + Caddyfile (Docker), discord2.service (ohne Docker)
+.github/workflows/   ci.yml (Tests), deploy.yml (Container bauen und auf den Server ausliefern)
+Dockerfile           Container-Image
 public/              Weboberfläche (HTML/CSS/JS ohne Build-Schritt)
   voice.js           Anrufe im Browser (WebRTC)
   voice-worklets.js  Mikrofon aufnehmen / Discord-Audio abspielen

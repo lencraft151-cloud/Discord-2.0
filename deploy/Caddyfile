@@ -1,5 +1,6 @@
-# Caddy holt automatisch ein HTTPS-Zertifikat für deine Domain (siehe ANLEITUNG.md, Teil 2b).
-# Ersetze die Domain und kopiere die Datei nach /etc/caddy/Caddyfile
-deine-domain.duckdns.org {
-	reverse_proxy localhost:3000
+# HTTPS für Discord 2.0. Die Domain kommt aus der Umgebungsvariable DOMAIN.
+# Für die manuelle Einrichtung ohne Docker (ANLEITUNG.md, Teil 2c) hier
+# {$DOMAIN} durch deine Domain und app:3000 durch localhost:3000 ersetzen.
+{$DOMAIN} {
+	reverse_proxy app:3000
 }

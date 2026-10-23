@@ -1,4 +1,4 @@
-# systemd-Dienst für Discord 2.0 (siehe ANLEITUNG.md, Teil 2b).
+# systemd-Dienst für Discord 2.0 (siehe ANLEITUNG.md, Teil 2c).
 # Kopieren nach /etc/systemd/system/discord2.service
 [Unit]
 Description=Discord 2.0

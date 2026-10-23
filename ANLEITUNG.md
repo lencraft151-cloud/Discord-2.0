@@ -3,7 +3,7 @@
 Diese Anleitung führt dich Schritt für Schritt durch alles:
 
 1. **Discord-App anlegen.** Das ist dein Bot, einmalig, dauert ca. 10 Minuten.
-2. **Discord 2.0 starten.** Entweder zum Ausprobieren auf deinem PC (2a) oder dauerhaft im Internet (2b).
+2. **Discord 2.0 starten.** Entweder zum Ausprobieren auf deinem PC (2a), dauerhaft im Internet **automatisch über GitHub Actions** (2b, empfohlen) oder von Hand auf einem Server (2c).
 3. **Auf deinem Discord-Konto einrichten.** Mit Discord anmelden, den Bot zu deinem Konto und zu deinen Servern hinzufügen.
 
 Am Ende gibt es einen Abschnitt [Probleme & Lösungen](#probleme--lösungen).
@@ -94,9 +94,86 @@ Zum Beenden drückst du im Terminal **Strg + C**.
 
 ---
 
-## Teil 2b: Dauerhaft im Internet hosten
+## Teil 2b: Automatisch über GitHub Actions (empfohlen)
 
-Damit Discord 2.0 rund um die Uhr läuft und deine Freunde es von überall öffnen können, brauchst du:
+Hier richtest du alles einmal ein. Danach musst du nie wieder etwas auf dem Server machen. Bei jedem Push auf `main` passiert automatisch:
+
+1. GitHub Actions testet den Code.
+2. Es baut daraus einen Container.
+3. Es spielt den Container auf deinem Server auf, inklusive HTTPS.
+
+> **Warum ein eigener Server?** GitHub Actions selbst kann Discord 2.0 nicht dauerhaft laufen lassen. Ein Durchlauf endet spätestens nach 6 Stunden, ist von außen nicht erreichbar, und GitHub erlaubt Actions nur zum Bauen, Testen und Ausliefern. Actions *liefert* also aus, und der Server *läuft*.
+
+**Du brauchst:**
+
+- **Einen kleinen Server (VPS)** mit Ubuntu 24.04, z. B. bei Hetzner, Netcup, IONOS oder Strato. Die kleinste Stufe reicht, das kostet etwa 4–6 € im Monat.
+- **Optional eine Domain**, z. B. kostenlos von [DuckDNS](https://www.duckdns.org). Ohne Domain bekommst du automatisch eine Adresse wie `91-99-12-34.sslip.io`.
+
+### 1. SSH-Schlüssel erstellen (auf deinem PC)
+
+Damit GitHub sich auf deinem Server anmelden kann, brauchst du ein Schlüsselpaar. Öffne ein Terminal (Windows: `cmd`) und gib ein:
+
+```
+ssh-keygen -t ed25519 -f d2-deploy -N ""
+```
+
+Das erzeugt zwei Dateien im aktuellen Ordner:
+
+- `d2-deploy.pub`: der **öffentliche** Schlüssel, der kommt auf den Server.
+- `d2-deploy`: der **private** Schlüssel, der kommt als Secret zu GitHub. Gib ihn sonst niemandem.
+
+### 2. Server mieten
+
+Beim Anlegen des Servers fragt der Anbieter nach einem **SSH-Key**. Öffne `d2-deploy.pub` mit dem Editor und füge den Inhalt dort ein. Als Betriebssystem **Ubuntu 24.04** wählen. Notiere dir danach die **IP-Adresse** (IPv4) des Servers.
+
+Mit eigener Domain: Trag diese IP bei DuckDNS bzw. deinem Domain-Anbieter ein.
+
+### 3. Secrets bei GitHub eintragen
+
+Gehe in deinem Repository auf **Settings → Secrets and variables → Actions** und lege mit **New repository secret** diese Einträge an:
+
+| Name | Inhalt |
+| --- | --- |
+| `DEPLOY_HOST` | IP-Adresse deines Servers, z. B. `91.99.12.34` |
+| `DEPLOY_SSH_KEY` | Kompletter Inhalt der Datei `d2-deploy` (mit den Zeilen `-----BEGIN …` und `-----END …`) |
+| `DISCORD_BOT_TOKEN` | Bot-Token aus Teil 1 |
+| `DISCORD_CLIENT_ID` | Client ID aus Teil 1 |
+| `DISCORD_CLIENT_SECRET` | Client Secret aus Teil 1 |
+| `DOMAIN` | *optional*: deine Domain, z. B. `meinchat.duckdns.org` |
+| `DEPLOY_USER` | *optional*: SSH-Benutzer, falls nicht `root` (er braucht dann Docker-Rechte) |
+| `ICE_SERVERS` | *optional*: TURN-Server für Anrufe, siehe `.env.example` |
+
+Secrets sind verschlüsselt. Auch du kannst sie nach dem Speichern nicht mehr ansehen, nur überschreiben.
+
+### 4. Starten
+
+- Merge den Pull Request in `main`. Dann startet das Deployment von selbst.
+- Oder starte es von Hand unter **Actions → Deploy → Run workflow**.
+
+Der erste Durchlauf dauert ein paar Minuten, weil dabei Docker auf dem Server installiert wird. Ist er grün (✅), steht in der **Zusammenfassung** des Durchlaufs:
+
+- die Adresse deiner Seite, z. B. `https://91-99-12-34.sslip.io`
+- die genaue **Redirect-Adresse**. Die trägst du im Developer Portal unter **OAuth2 → Redirects** ein (Teil 1, Schritt 9).
+
+Fertig, weiter mit [Teil 3](#teil-3-auf-deinem-discord-konto-einrichten).
+
+### Danach
+
+- **Updates:** Jeder Push auf `main` wird automatisch ausgeliefert. Deine Daten bleiben dabei erhalten.
+- **Secret geändert?** Unter **Actions → Deploy → Run workflow** neu ausliefern.
+- **Kosten bei GitHub:** Für öffentliche Repositories ist Actions kostenlos. Private Repositories haben 2000 Freiminuten im Monat, und ein Deployment braucht etwa 2–4 Minuten.
+- **Backup** (auf deinem PC im Terminal, IP anpassen):
+  ```
+  ssh -i d2-deploy root@91.99.12.34 "docker run --rm -v discord-20_data:/data alpine tar czf - -C /data ." > discord2-backup.tgz
+  ```
+
+> Ohne eigenen Server laufen auch Anbieter wie Railway oder Fly.io mit dem `Dockerfile` (Daten-Volume bei `/data` einhängen). Das ist hier aber nicht getestet.
+
+---
+
+## Teil 2c: Von Hand auf einem Server (ohne Docker)
+
+Nur nötig, wenn du Teil 2b **nicht** nutzt. Damit Discord 2.0 rund um die Uhr läuft und deine Freunde es von überall öffnen können, brauchst du:
 
 - **Einen kleinen Server (VPS)** mit Ubuntu 24.04, z. B. bei Hetzner, Netcup, IONOS oder Strato. Die kleinste Stufe reicht (1–2 CPU-Kerne, 2 GB RAM), das kostet etwa 4–6 € im Monat.
 - **Eine Domain.** Kostenlos geht das z. B. mit [DuckDNS](https://www.duckdns.org): Dort mit Discord oder GitHub anmelden, eine Subdomain wie `meinchat.duckdns.org` anlegen und bei *current ip* die IP-Adresse deines Servers eintragen.
@@ -178,7 +255,7 @@ Im Log sollte `[discord] Verbunden als …` stehen.
 
 ```bash
 sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
-sudo nano /etc/caddy/Caddyfile      # "deine-domain.duckdns.org" durch deine Domain ersetzen
+sudo nano /etc/caddy/Caddyfile      # {$DOMAIN} durch deine Domain und app:3000 durch localhost:3000 ersetzen
 sudo systemctl reload caddy
 ```
 
@@ -247,6 +324,9 @@ Auf Servern, auf denen du keine Admin-Rechte hast, muss ein Admin den Bot hinzuf
 | Bot kommt nicht in den Sprachkanal | Der Bot braucht dort „Verbinden“ und „Sprechen“. Außerdem kann er pro Server nur in **einem** Sprachkanal gleichzeitig sein. |
 | `/discord2` erscheint nicht | Nach dem Hinzufügen kann es ein paar Minuten dauern. Discord neu laden (Strg + R). Prüfe auch, ob unter **Installation** „User Install“ angehakt ist. |
 | „Private application cannot have a default authorization link“ | Du hast „Public Bot“ ausgeschaltet. Unter **Installation** den *Install Link* auf **None** stellen. |
-| Seite nicht erreichbar (Teil 2b) | Zeigt die Domain auf die richtige IP (DuckDNS)? Läuft der Dienst (`sudo systemctl status discord2`)? Sind die Ports 80/443 offen (`sudo ufw status`)? |
+| Deploy-Durchlauf rot bei „SSH vorbereiten“ oder `Permission denied (publickey)` | `DEPLOY_HOST` ist falsch, oder `DEPLOY_SSH_KEY` ist nicht der private Schlüssel zum öffentlichen auf dem Server. Kopiere den Inhalt von `d2-deploy` noch einmal komplett. |
+| Deploy-Durchlauf rot bei „Prüfen, ob die Seite antwortet“ | Unten im Log stehen die Server-Logs. Häufig sind die Ports 80/443 beim Anbieter per Firewall gesperrt (z. B. Hetzner-„Firewall“ im Webinterface), oder die Domain zeigt noch nicht auf die IP. |
+| Im Actions-Tab steht „Image gebaut, aber nicht deployt“ | Das Secret `DEPLOY_HOST` fehlt (Teil 2b, Schritt 3). |
+| Seite nicht erreichbar (Teil 2c) | Zeigt die Domain auf die richtige IP (DuckDNS)? Läuft der Dienst (`sudo systemctl status discord2`)? Sind die Ports 80/443 offen (`sudo ufw status`)? |
 
 Weitere technische Details stehen in der [README](README.md).

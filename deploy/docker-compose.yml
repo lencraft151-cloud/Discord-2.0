@@ -1,0 +1,32 @@
+# Läuft auf deinem Server. Wird automatisch von GitHub Actions hochgeladen
+# und gestartet (siehe .github/workflows/deploy.yml und ANLEITUNG.md).
+# .env enthält IMAGE und DOMAIN, app.env die Einstellungen der App (Tokens).
+services:
+  app:
+    image: ${IMAGE}
+    env_file: app.env
+    volumes:
+      - data:/data
+    restart: unless-stopped
+
+  # Caddy kümmert sich um HTTPS (Zertifikat von Let's Encrypt, automatisch erneuert).
+  caddy:
+    image: caddy:2
+    environment:
+      DOMAIN: ${DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+    restart: unless-stopped
+
+volumes:
+  data:
+  caddy_data:
+  caddy_config:
