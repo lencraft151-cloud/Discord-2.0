@@ -1,0 +1,5 @@
+# Caddy holt automatisch ein HTTPS-Zertifikat für deine Domain (siehe ANLEITUNG.md, Teil 2b).
+# Ersetze die Domain und kopiere die Datei nach /etc/caddy/Caddyfile
+deine-domain.duckdns.org {
+	reverse_proxy localhost:3000
+}

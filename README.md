@@ -20,6 +20,8 @@ Discord verbietet in seinen Nutzungsbedingungen inoffizielle Clients und automat
 
 ## Starten
 
+> **Neu hier?** Die [Schritt-für-Schritt-Anleitung](ANLEITUNG.md) erklärt alles: Discord-App anlegen, auf dem PC oder einem Server hosten und den Bot auf deinem Discord-Konto und deinen Servern einrichten.
+
 Du brauchst **Node.js 22.13 oder neuer** (die Datenbank nutzt das eingebaute `node:sqlite`).
 
 ```bash
