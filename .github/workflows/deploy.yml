@@ -1,0 +1,142 @@
+name: Deploy
+
+# Baut bei jedem Push auf main ein Container-Image und startet es auf deinem
+# Server. Alles Nötige kommt aus den GitHub-Secrets (siehe ANLEITUNG.md, Teil 2b).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.name.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: name
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.name.outputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: image
+    runs-on: ubuntu-latest
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER || 'root' }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DOMAIN: ${{ secrets.DOMAIN }}
+      IMAGE: ${{ needs.image.outputs.image }}
+    steps:
+      - name: Ohne DEPLOY_HOST nur bauen
+        if: env.DEPLOY_HOST == ''
+        run: |
+          echo "### Image gebaut, aber nicht deployt" >> "$GITHUB_STEP_SUMMARY"
+          echo "Lege die Secrets DEPLOY_HOST und DEPLOY_SSH_KEY an (siehe ANLEITUNG.md), dann wird automatisch auf deinen Server deployt." >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/checkout@v4
+        if: env.DEPLOY_HOST != ''
+
+      - name: SSH vorbereiten
+        if: env.DEPLOY_HOST != ''
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          printf 'Host target\n  HostName %s\n  User %s\n  IdentityFile ~/.ssh/id_deploy\n' "$DEPLOY_HOST" "$DEPLOY_USER" > ~/.ssh/config
+          chmod 600 ~/.ssh/config ~/.ssh/known_hosts
+          # Ohne eigene Domain: <ip>.sslip.io zeigt automatisch auf die IP des Servers.
+          if [ -z "$DOMAIN" ]; then echo "DOMAIN=${DEPLOY_HOST//./-}.sslip.io" >> "$GITHUB_ENV"; fi
+
+      - name: Einstellungen schreiben
+        if: env.DEPLOY_HOST != ''
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CLIENT_ID: ${{ secrets.DISCORD_CLIENT_ID }}
+          DISCORD_CLIENT_SECRET: ${{ secrets.DISCORD_CLIENT_SECRET }}
+          ICE_SERVERS: ${{ secrets.ICE_SERVERS }}
+          AVATAR_URL_TEMPLATE: ${{ secrets.AVATAR_URL_TEMPLATE }}
+        run: |
+          umask 077
+          {
+            echo "PUBLIC_URL=https://$DOMAIN"
+            echo "DISCORD_BOT_TOKEN=$DISCORD_BOT_TOKEN"
+            echo "DISCORD_CLIENT_ID=$DISCORD_CLIENT_ID"
+            echo "DISCORD_CLIENT_SECRET=$DISCORD_CLIENT_SECRET"
+            echo "ICE_SERVERS=$ICE_SERVERS"
+            echo "AVATAR_URL_TEMPLATE=$AVATAR_URL_TEMPLATE"
+          } > app.env
+          printf 'IMAGE=%s\nDOMAIN=%s\n' "$IMAGE" "$DOMAIN" > compose.env
+
+      - name: Auf den Server übertragen und starten
+        if: env.DEPLOY_HOST != ''
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          # Beim ersten Mal Docker installieren
+          ssh target 'command -v docker >/dev/null || curl -fsSL https://get.docker.com | sh'
+          ssh target 'mkdir -p /opt/discord-2.0 && chmod 700 /opt/discord-2.0'
+          scp deploy/docker-compose.yml deploy/Caddyfile target:/opt/discord-2.0/
+          scp app.env target:/opt/discord-2.0/app.env
+          scp compose.env target:/opt/discord-2.0/.env
+          rm app.env compose.env
+          # shellcheck disable=SC2029 # GHCR_USER soll hier (im Runner) eingesetzt werden
+          printf '%s' "$GHCR_TOKEN" | ssh target "docker login ghcr.io -u '$GHCR_USER' --password-stdin"
+          ssh target 'cd /opt/discord-2.0 && docker compose pull && docker compose up -d --remove-orphans'
+          ssh target 'docker logout ghcr.io; docker image prune -f'
+
+      - name: Prüfen, ob die Seite antwortet
+        if: env.DEPLOY_HOST != ''
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -fsS "https://$DOMAIN/api/config" >/dev/null; then
+              {
+                echo "### ✅ Discord 2.0 läuft: https://$DOMAIN"
+                echo ""
+                echo "Trage im Discord Developer Portal unter **OAuth2 → Redirects** ein:"
+                echo ""
+                echo '```'
+                echo "https://$DOMAIN/auth/discord/callback"
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Seite antwortet nicht unter https://$DOMAIN" >&2
+          ssh target 'cd /opt/discord-2.0 && docker compose ps && docker compose logs --tail 50'
+          exit 1

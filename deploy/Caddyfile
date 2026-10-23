@@ -1,0 +1,6 @@
+# HTTPS für Discord 2.0. Die Domain kommt aus der Umgebungsvariable DOMAIN.
+# Für die manuelle Einrichtung ohne Docker (ANLEITUNG.md, Teil 2c) hier
+# {$DOMAIN} durch deine Domain und app:3000 durch localhost:3000 ersetzen.
+{$DOMAIN} {
+	reverse_proxy app:3000
+}
