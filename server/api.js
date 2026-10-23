@@ -1,7 +1,7 @@
 import express from 'express';
 import { HttpError } from './store.js';
 
-export function createApi({ store, chat }) {
+export function createApi({ store, chat, voice, oauth }) {
   const api = express.Router();
   api.use(express.json({ limit: '64kb' }));
 
@@ -16,10 +16,19 @@ export function createApi({ store, chat }) {
 
   const bridgeInfo = () => {
     const bridge = chat.bridge;
-    return { enabled: Boolean(bridge), ready: Boolean(bridge?.ready), inviteUrl: bridge?.inviteUrl() ?? null };
+    const ready = Boolean(bridge?.ready);
+    return {
+      enabled: Boolean(bridge),
+      ready,
+      login: Boolean(oauth),
+      inviteUrl: ready ? bridge.inviteUrl() : null,
+      userInstallUrl: ready ? bridge.userInstallUrl() : null,
+    };
   };
 
   // ---------- Anmeldung ----------
+
+  api.get('/config', (req, res) => res.json({ discordLogin: Boolean(oauth) }));
 
   api.post(
     '/auth/register',
@@ -55,7 +64,43 @@ export function createApi({ store, chat }) {
 
   api.get(
     '/me',
-    route((req) => ({ user: req.user, discord: bridgeInfo() })),
+    route((req) => ({ user: req.user, discord: bridgeInfo(), iceServers: voice.iceServers })),
+  );
+
+  // ---------- Discord-Konto ----------
+
+  const requireOAuth = () => {
+    if (!oauth) throw new HttpError(503, 'Die Anmeldung mit Discord ist auf diesem Server nicht eingerichtet');
+  };
+
+  api.post(
+    '/discord/link',
+    route((req) => {
+      requireOAuth();
+      return { url: oauth.authorizeUrl(req.user.id) };
+    }),
+  );
+
+  // Deine eigenen Discord-Server: beitreten, wenn der Bot dort ist, sonst Bot hinzufügen.
+  api.get(
+    '/discord/guilds',
+    route(async (req) => {
+      requireOAuth();
+      const bridge = chat.bridge?.ready ? chat.bridge : null;
+      const guilds = await oauth.listGuilds(req.user.id);
+      return guilds
+        .map((guild) => {
+          const server = store.serverByGuild(guild.id);
+          const connected = Boolean(server?.active && bridge?.hasGuild(guild.id));
+          return {
+            ...guild,
+            serverId: connected ? server.id : null,
+            joined: connected && store.isMember(server.id, req.user.id),
+            inviteUrl: !connected && guild.canManage && bridge ? bridge.inviteUrl(guild.id) : null,
+          };
+        })
+        .sort((a, b) => Number(Boolean(b.serverId)) - Number(Boolean(a.serverId)) || a.name.localeCompare(b.name));
+    }),
   );
 
   // ---------- Server ----------
@@ -109,9 +154,11 @@ export function createApi({ store, chat }) {
     }),
   );
 
+  const withVoice = (channel) => (channel.type === 'voice' ? { ...channel, voice: voice.stateFor(channel.id) } : channel);
+
   api.get(
     '/servers/:id/channels',
-    route((req) => store.listChannels(requireMember(req))),
+    route((req) => store.listChannels(requireMember(req)).map(withVoice)),
   );
 
   api.post(
@@ -120,7 +167,7 @@ export function createApi({ store, chat }) {
       const serverId = requireMember(req);
       const server = store.getServer(serverId);
       if (server.discord_guild_id) throw new HttpError(400, 'Kanäle von Discord-Servern werden auf Discord verwaltet');
-      const channel = store.createChannel(req.user.id, serverId, req.body?.name);
+      const channel = store.createChannel(req.user.id, serverId, req.body?.name, req.body?.type ?? 'text');
       chat.channelsChanged(serverId);
       return channel;
     }),
@@ -149,6 +196,7 @@ export function createApi({ store, chat }) {
       if (channel.discord_channel_id && !channel.backfilled && !req.query.before && chat.bridge?.ready) {
         await chat.bridge.backfill(channel).catch((err) => console.warn('[discord] Verlauf laden fehlgeschlagen:', err.message));
       }
+      if (channel.type === 'voice') return [];
       return store.listMessages(channel.id, { before: Number(req.query.before) || null, limit: req.query.limit });
     }),
   );
@@ -162,13 +210,16 @@ export function createApi({ store, chat }) {
 
   api.get(
     '/dms',
-    route((req) => store.listDms(req.user.id)),
+    route((req) => store.listDms(req.user.id).map((dm) => ({ ...dm, voice: voice.stateFor(dm.id) }))),
   );
 
   api.post(
     '/dms',
     route(async (req) => {
       if (req.body?.discordUserId) {
+        // Hat die Person ein mit Discord verknüpftes Konto hier, direkt dort schreiben.
+        const linked = store.userByDiscordId(String(req.body.discordUserId));
+        if (linked && linked.id !== req.user.id) return store.openDm(req.user.id, linked.id);
         if (!chat.bridge?.ready) throw new HttpError(503, 'Die Discord-Brücke ist nicht verbunden');
         const discordUser = await chat.bridge.fetchUser(String(req.body.discordUserId));
         if (!discordUser) throw new HttpError(404, 'Discord-Nutzer nicht gefunden');

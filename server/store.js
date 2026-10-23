@@ -18,6 +18,7 @@ function hashPassword(password) {
 }
 
 function checkPassword(password, stored) {
+  if (!stored) return false; // Konto ohne Passwort (nur Discord-Anmeldung)
   const [salt, hash] = stored.split(':');
   const expected = Buffer.from(hash, 'hex');
   const actual = scryptSync(password, Buffer.from(salt, 'hex'), expected.length);
@@ -35,7 +36,15 @@ export function createStore(db) {
   // ---------- Nutzer & Sitzungen ----------
 
   function publicUser(row) {
-    return row && { id: row.id, username: row.username, color: row.color };
+    return (
+      row && {
+        id: row.id,
+        username: row.username,
+        color: row.color,
+        avatar: row.avatar_url ?? undefined,
+        discordLinked: row.discord_id != null,
+      }
+    );
   }
 
   function register(username, password) {
@@ -82,6 +91,61 @@ export function createStore(db) {
 
   function getUser(id) {
     return publicUser(q('SELECT * FROM users WHERE id = ?').get(id));
+  }
+
+  function userByDiscordId(discordId) {
+    return publicUser(q('SELECT * FROM users WHERE discord_id = ?').get(discordId));
+  }
+
+  function freeUsername(wanted) {
+    let base = wanted.replace(/[^\p{L}\p{N}_.-]/gu, '').slice(0, 28);
+    if (base.length < 2) base = `nutzer${base}`;
+    let name = base;
+    while (q('SELECT 1 FROM users WHERE username = ?').get(name)) {
+      name = `${base}${Math.floor(1000 + Math.random() * 9000)}`;
+    }
+    return name;
+  }
+
+  function saveDiscordTokens(userId, tokens) {
+    q(
+      'UPDATE users SET discord_access_token = ?, discord_refresh_token = ?, discord_token_expires = ? WHERE id = ?',
+    ).run(tokens.accessToken, tokens.refreshToken ?? null, tokens.expiresAt ?? null, userId);
+  }
+
+  function getDiscordTokens(userId) {
+    const row = q('SELECT discord_access_token, discord_refresh_token, discord_token_expires FROM users WHERE id = ?').get(
+      userId,
+    );
+    return row?.discord_access_token
+      ? { accessToken: row.discord_access_token, refreshToken: row.discord_refresh_token, expiresAt: row.discord_token_expires }
+      : null;
+  }
+
+  // Anmeldung über Discord: vorhandenes verknüpftes Konto oder ein neues anlegen.
+  function loginWithDiscord(discordUser, tokens) {
+    let row = q('SELECT * FROM users WHERE discord_id = ?').get(discordUser.id);
+    if (!row) {
+      const color = COLORS[Math.floor(Math.random() * COLORS.length)];
+      const { lastInsertRowid } = q(
+        `INSERT INTO users (username, password_hash, color, discord_id, avatar_url, created_at) VALUES (?, '', ?, ?, ?, ?)`,
+      ).run(freeUsername(discordUser.username), color, discordUser.id, discordUser.avatar, now());
+      row = { id: Number(lastInsertRowid) };
+    } else {
+      q('UPDATE users SET avatar_url = ? WHERE id = ?').run(discordUser.avatar, row.id);
+    }
+    saveDiscordTokens(row.id, tokens);
+    return getUser(row.id);
+  }
+
+  function linkDiscord(userId, discordUser, tokens) {
+    const owner = q('SELECT id FROM users WHERE discord_id = ?').get(discordUser.id);
+    if (owner && owner.id !== userId) {
+      throw new HttpError(409, 'Dieses Discord-Konto ist schon mit einem anderen Konto verknüpft');
+    }
+    q('UPDATE users SET discord_id = ?, avatar_url = ? WHERE id = ?').run(discordUser.id, discordUser.avatar, userId);
+    saveDiscordTokens(userId, tokens);
+    return getUser(userId);
   }
 
   function searchUsers(query, excludeId) {
@@ -228,13 +292,14 @@ export function createStore(db) {
 
   function listChannels(serverId) {
     return q(
-      `SELECT * FROM channels WHERE server_id = ? AND type = 'text' AND active = 1 ORDER BY position, id`,
+      `SELECT * FROM channels WHERE server_id = ? AND type IN ('text', 'voice') AND active = 1 ORDER BY position, id`,
     )
       .all(serverId)
       .map(serializeChannel);
   }
 
-  function createChannel(userId, serverId, name) {
+  function createChannel(userId, serverId, name, type = 'text') {
+    if (type !== 'text' && type !== 'voice') throw new HttpError(400, 'Unbekannter Kanaltyp');
     const server = getServer(serverId);
     if (!server || server.owner_id !== userId) {
       throw new HttpError(403, 'Nur der Besitzer kann Kanäle erstellen');
@@ -245,11 +310,8 @@ export function createStore(db) {
       .replace(/\s+/g, '-');
     if (!name || name.length > 100) throw new HttpError(400, 'Kanalname: 1–100 Zeichen');
     const id = Number(
-      q(`INSERT INTO channels (server_id, type, name, created_at) VALUES (?, 'text', ?, ?)`).run(
-        serverId,
-        name,
-        now(),
-      ).lastInsertRowid,
+      q(`INSERT INTO channels (server_id, type, name, created_at) VALUES (?, ?, ?, ?)`).run(serverId, type, name, now())
+        .lastInsertRowid,
     );
     return serializeChannel(getChannel(id));
   }
@@ -487,13 +549,14 @@ export function createStore(db) {
     return q('SELECT * FROM servers WHERE discord_guild_id = ?').get(guildId);
   }
 
-  function upsertGuildChannel(serverId, { id, name, position }) {
+  function upsertGuildChannel(serverId, { id, name, position, type = 'text' }) {
     q(
       `INSERT INTO channels (server_id, type, name, position, discord_channel_id, active, created_at)
-       VALUES (?, 'text', ?, ?, ?, 1, ?)
+       VALUES (?, ?, ?, ?, ?, 1, ?)
        ON CONFLICT (discord_channel_id) DO UPDATE SET
-         server_id = excluded.server_id, name = excluded.name, position = excluded.position, active = 1`,
-    ).run(serverId, name, position ?? 0, id, now());
+         server_id = excluded.server_id, type = excluded.type, name = excluded.name,
+         position = excluded.position, active = 1`,
+    ).run(serverId, type, name, position ?? 0, id, now());
     return q('SELECT * FROM channels WHERE discord_channel_id = ?').get(id);
   }
 
@@ -527,6 +590,11 @@ export function createStore(db) {
     deleteSession,
     userByToken,
     getUser,
+    userByDiscordId,
+    loginWithDiscord,
+    linkDiscord,
+    getDiscordTokens,
+    saveDiscordTokens,
     searchUsers,
     getServer,
     listServers,

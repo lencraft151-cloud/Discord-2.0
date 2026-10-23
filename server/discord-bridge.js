@@ -1,20 +1,31 @@
 import {
+  ApplicationIntegrationType,
   ChannelType,
   Client,
   DiscordAPIError,
   GatewayIntentBits,
+  InteractionContextType,
+  MessageFlags,
   OAuth2Scopes,
   Partials,
   PermissionFlagsBits,
 } from 'discord.js';
+import { getVoiceConnection } from '@discordjs/voice';
+import { HttpError } from './store.js';
+import { createDiscordVoiceSession } from './discord-voice.js';
 
 // Die Brücke läuft über einen offiziellen Discord-Bot. Discord-Serveradmins laden
 // den Bot ein; danach erscheinen ihre Server in Discord 2.0 und Nachrichten
 // werden in beide Richtungen gespiegelt. Discord-2.0-Nutzer schreiben auf
 // Discord über einen Webhook mit eigenem Namen. Direktnachrichten an
-// Discord-Nutzer schickt der Bot.
+// Discord-Nutzer schickt der Bot. In Sprachkanälen tritt der Bot bei und
+// leitet Audio zwischen Discord und dem Browser weiter.
 
-const BRIDGED_CHANNEL_TYPES = new Set([ChannelType.GuildText, ChannelType.GuildAnnouncement]);
+const BRIDGED_CHANNEL_TYPES = new Map([
+  [ChannelType.GuildText, 'text'],
+  [ChannelType.GuildAnnouncement, 'text'],
+  [ChannelType.GuildVoice, 'voice'],
+]);
 const WEBHOOK_NAME = 'D2 Bridge';
 const NAME_SUFFIX = ' (D2)';
 
@@ -24,9 +35,24 @@ export const BOT_PERMISSIONS =
   PermissionFlagsBits.ReadMessageHistory |
   PermissionFlagsBits.ManageWebhooks |
   PermissionFlagsBits.EmbedLinks |
-  PermissionFlagsBits.AttachFiles;
+  PermissionFlagsBits.AttachFiles |
+  PermissionFlagsBits.Connect |
+  PermissionFlagsBits.Speak;
 
-const REQUIRED_CHANNEL_PERMISSIONS = PermissionFlagsBits.ViewChannel | PermissionFlagsBits.ReadMessageHistory;
+const REQUIRED_PERMISSIONS = {
+  text: PermissionFlagsBits.ViewChannel | PermissionFlagsBits.ReadMessageHistory,
+  voice: PermissionFlagsBits.ViewChannel | PermissionFlagsBits.Connect,
+};
+
+// Slash-Befehl, der auch funktioniert, wenn Nutzer den Bot nur zu ihrem eigenen Konto hinzufügen.
+const COMMANDS = [
+  {
+    name: 'discord2',
+    description: 'Öffnet Discord 2.0 – schreiben und telefonieren im Browser',
+    integrationTypes: [ApplicationIntegrationType.GuildInstall, ApplicationIntegrationType.UserInstall],
+    contexts: [InteractionContextType.Guild, InteractionContextType.BotDM, InteractionContextType.PrivateChannel],
+  },
+];
 
 // Discord verbietet "discord" und "clyde" in Webhook-Namen.
 export function webhookUsername(username) {
@@ -52,12 +78,13 @@ function discordAuthor(user, member) {
   };
 }
 
-export function createDiscordBridge({ token, store, chat, avatarUrlTemplate }) {
+export function createDiscordBridge({ token, store, chat, avatarUrlTemplate, publicUrl, hooks = {} }) {
   const client = new Client({
     intents: [
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMessages,
       GatewayIntentBits.GuildMembers,
+      GatewayIntentBits.GuildVoiceStates,
       GatewayIntentBits.MessageContent,
       GatewayIntentBits.DirectMessages,
     ],
@@ -68,19 +95,20 @@ export function createDiscordBridge({ token, store, chat, avatarUrlTemplate }) {
   const ownWebhookIds = new Set();
   let ready = false;
 
-  function canRead(channel) {
+  function canUse(channel, type) {
     const permissions = channel.permissionsFor(client.user);
-    return Boolean(permissions?.has(REQUIRED_CHANNEL_PERMISSIONS));
+    return Boolean(permissions?.has(REQUIRED_PERMISSIONS[type]));
   }
 
   function syncGuild(guild) {
     const server = store.upsertGuild({ id: guild.id, name: guild.name, iconUrl: guild.iconURL({ size: 128 }) });
     const visible = [];
     for (const channel of guild.channels.cache.values()) {
-      if (!BRIDGED_CHANNEL_TYPES.has(channel.type) || !canRead(channel)) continue;
+      const type = BRIDGED_CHANNEL_TYPES.get(channel.type);
+      if (!type || !canUse(channel, type)) continue;
       // rawPosition plus Kategorie-Position ergibt ungefähr die Reihenfolge wie in Discord.
       const position = (channel.parent?.rawPosition ?? -1) * 1000 + channel.rawPosition;
-      store.upsertGuildChannel(server.id, { id: channel.id, name: channel.name, position });
+      store.upsertGuildChannel(server.id, { id: channel.id, name: channel.name, position, type });
       visible.push(channel.id);
     }
     store.pruneGuildChannels(server.id, visible);
@@ -100,6 +128,25 @@ export function createDiscordBridge({ token, store, chat, avatarUrlTemplate }) {
       refreshGuild(guild);
       // Mitgliederliste laden, damit die Nutzersuche funktioniert.
       guild.members.fetch().catch((err) => console.warn(`[discord] Mitglieder von ${guild.name}:`, err.message));
+    }
+    await client.application.commands
+      .set(COMMANDS)
+      .catch((err) => console.warn('[discord] Slash-Befehle registrieren fehlgeschlagen:', err.message));
+  });
+
+  client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isChatInputCommand() || interaction.commandName !== 'discord2') return;
+    const lines = [`**Discord 2.0:** ${publicUrl}`, 'Melde dich dort mit Discord an, um zu schreiben und zu telefonieren.'];
+    // Bei "nur zum Konto hinzugefügt" ist der Bot selbst nicht auf dem Server.
+    if (interaction.guildId && !client.guilds.cache.has(interaction.guildId)) {
+      lines.push(`Damit dieser Server in Discord 2.0 erscheint, muss ein Admin den Bot hinzufügen: ${inviteUrl(interaction.guildId)}`);
+    }
+    await interaction.reply({ content: lines.join('\n'), flags: MessageFlags.Ephemeral }).catch(() => {});
+  });
+
+  client.on('voiceStateUpdate', (before, after) => {
+    for (const channelId of new Set([before.channelId, after.channelId])) {
+      if (channelId) hooks.voiceMembersChanged?.(channelId);
     }
   });
 
@@ -200,6 +247,7 @@ export function createDiscordBridge({ token, store, chat, avatarUrlTemplate }) {
   }
 
   function avatarFor(user) {
+    if (user.avatar) return user.avatar;
     return avatarUrlTemplate
       ? avatarUrlTemplate.replace('{username}', encodeURIComponent(user.username)).replace('{id}', String(user.id))
       : undefined;
@@ -301,9 +349,49 @@ export function createDiscordBridge({ token, store, chat, avatarUrlTemplate }) {
     return { id: user.id, username: user.displayName ?? user.username, avatar: user.displayAvatarURL({ size: 64 }) };
   }
 
-  function inviteUrl() {
-    if (!client.application?.id && !client.user?.id) return null;
-    return client.generateInvite({ scopes: [OAuth2Scopes.Bot], permissions: BOT_PERMISSIONS });
+  // Startet die Sprachverbindung des Bots für einen gespiegelten Sprachkanal.
+  function joinVoice(channelRow, { onAudio, onEnd }) {
+    const channel = client.channels.cache.get(channelRow.discord_channel_id);
+    if (!channel?.isVoiceBased()) throw new HttpError(404, 'Sprachkanal existiert auf Discord nicht mehr');
+    const existing = getVoiceConnection(channel.guild.id);
+    if (existing && existing.joinConfig.channelId !== channel.id) {
+      throw new HttpError(409, 'Der Bot ist in diesem Discord-Server schon in einem anderen Sprachkanal');
+    }
+    return createDiscordVoiceSession({ guild: channel.guild, channelId: channel.id, onAudio, onEnd });
+  }
+
+  function voiceMembers(discordChannelId) {
+    const channel = client.channels.cache.get(discordChannelId);
+    if (!channel?.isVoiceBased()) return [];
+    return [...channel.members.values()]
+      .filter((m) => m.id !== client.user.id)
+      .map((m) => ({
+        id: m.id,
+        username: m.displayName,
+        avatar: m.displayAvatarURL({ size: 64 }),
+        muted: Boolean(m.voice.mute),
+        deafened: Boolean(m.voice.deaf),
+      }));
+  }
+
+  // Einladungslink für einen Server (mit guildId direkt für diesen Server vorausgewählt).
+  function inviteUrl(guildId) {
+    if (!client.application?.id) return null;
+    return client.generateInvite({
+      scopes: [OAuth2Scopes.Bot, OAuth2Scopes.ApplicationsCommands],
+      permissions: BOT_PERMISSIONS,
+      ...(guildId ? { guild: guildId, disableGuildSelect: true } : {}),
+    });
+  }
+
+  // Link, um den Bot nur zum eigenen Discord-Konto hinzuzufügen ("User Install").
+  function userInstallUrl() {
+    if (!client.application?.id) return null;
+    return `https://discord.com/oauth2/authorize?client_id=${client.application.id}&integration_type=1&scope=applications.commands`;
+  }
+
+  function hasGuild(guildId) {
+    return client.guilds.cache.has(guildId);
   }
 
   function describeError(err) {
@@ -327,6 +415,10 @@ export function createDiscordBridge({ token, store, chat, avatarUrlTemplate }) {
     searchUsers,
     fetchUser,
     inviteUrl,
+    userInstallUrl,
+    hasGuild,
+    joinVoice,
+    voiceMembers,
     describeError,
   };
 }

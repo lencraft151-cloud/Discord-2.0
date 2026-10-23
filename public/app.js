@@ -1,3 +1,5 @@
+import { VoiceClient } from './voice.js';
+
 const $ = (selector) => document.querySelector(selector);
 
 const state = {
@@ -14,11 +16,14 @@ const state = {
   unreadServers: new Set(),
   online: new Set(),
   showMembers: true,
+  voiceStates: new Map(), // Kanal-ID -> wer gerade im Anruf/Sprachkanal ist
+  ringing: null, // Kanal-ID eines eingehenden Anrufs
   loadingOlder: false,
   reachedStart: false,
 };
 
 let socket = null;
+const voice = new VoiceClient(() => socket);
 
 // ---------- Hilfsfunktionen ----------
 
@@ -146,8 +151,7 @@ $('#auth-form').addEventListener('submit', async (event) => {
       method: 'POST',
       body: { username: form.username.value, password: form.password.value },
     });
-    state.token = data.token;
-    localStorage.setItem('token', data.token);
+    setToken(data.token);
     form.reset();
     await start();
   } catch (err) {
@@ -158,7 +162,30 @@ $('#auth-form').addEventListener('submit', async (event) => {
   }
 });
 
+function setToken(token) {
+  state.token = token;
+  localStorage.setItem('token', token);
+}
+
+// Rückkehr von "Mit Discord anmelden" bzw. "Discord verbinden" (Daten stehen im #-Teil der URL).
+function readRedirectHash() {
+  const params = new URLSearchParams(location.hash.slice(1));
+  if (![...params.keys()].length) return {};
+  history.replaceState(null, '', location.pathname);
+  if (params.get('login')) setToken(params.get('login'));
+  return { error: params.get('auth_error'), linked: params.has('discord_linked') };
+}
+
+async function showDiscordLogin() {
+  const config = await fetch('/api/config')
+    .then((r) => r.json())
+    .catch(() => ({}));
+  $('#discord-login').hidden = !config.discordLogin;
+  $('#discord-login-divider').hidden = !config.discordLogin;
+}
+
 async function logout(callServer = true) {
+  voice.leave();
   if (callServer) await api('/auth/logout', { method: 'POST' }).catch(() => {});
   localStorage.removeItem('token');
   state.token = null;
@@ -210,7 +237,7 @@ function connectSocket() {
   socket.on('channels:changed', async ({ serverId }) => {
     if (state.view !== serverId) return;
     await loadChannels();
-    if (state.channel && !state.channels.some((c) => c.id === state.channel.id)) openChannel(state.channels[0]);
+    if (state.channel && !state.channels.some((c) => c.id === state.channel.id)) openChannel(firstTextChannel());
   });
   socket.on('presence', ({ userId, online }) => {
     if (online) state.online.add(userId);
@@ -218,6 +245,30 @@ function connectSocket() {
     if (state.view !== 'home' && state.showMembers) renderMembers();
   });
   socket.on('typing', onTyping);
+
+  socket.on('disconnect', () => {
+    if (voice.connected) {
+      voice.leave();
+      toast('Verbindung verloren – Anruf beendet', true);
+    }
+  });
+  socket.on('voice:state', onVoiceState);
+  socket.on('voice:peer-joined', ({ socketId, user }) => voice.peerJoined(socketId, user));
+  socket.on('voice:peer-left', ({ socketId }) => voice.removePeer(socketId));
+  socket.on('voice:signal', (payload) => voice.onSignal(payload).catch((err) => console.warn('WebRTC:', err)));
+  socket.on('voice:audio', (data) => voice.onDiscordAudio(data));
+  socket.on('voice:bridge-lost', () => {
+    voice.bridgeLost();
+    toast('Der Bot wurde vom Discord-Sprachkanal getrennt', true);
+  });
+  socket.on('voice:ring', onRing);
+  socket.on('voice:ring-end', ({ channelId }) => {
+    if (state.ringing === channelId) {
+      state.ringing = null;
+      closeModal();
+    }
+  });
+  socket.on('voice:declined', ({ username }) => toast(`${username} hat den Anruf abgelehnt`));
 }
 
 // ---------- Server-Leiste ----------
@@ -276,9 +327,13 @@ async function selectView(view) {
     $('#sidebar-action').title = 'Kanal erstellen';
     $('#members-toggle').hidden = false;
     await loadChannels();
-    openChannel(state.channels[0]);
+    openChannel(firstTextChannel());
     renderMembers();
   }
+}
+
+function firstTextChannel() {
+  return state.channels.find((c) => c.type === 'text') ?? state.channels[0];
 }
 
 function currentServer() {
@@ -289,11 +344,13 @@ function currentServer() {
 
 async function loadChannels() {
   state.channels = await api(`/servers/${state.view}/channels`);
+  for (const channel of state.channels) if (channel.voice) state.voiceStates.set(channel.id, channel.voice);
   renderSidebar();
 }
 
 async function loadDms() {
   state.dms = await api('/dms');
+  for (const dm of state.dms) if (dm.voice) state.voiceStates.set(dm.id, dm.voice);
   if (state.view === 'home') renderSidebar();
   renderServers();
 }
@@ -312,6 +369,7 @@ function renderSidebar() {
               { className: itemClass(dm), onclick: () => openChannel(dm) },
               avatar(dm.recipient, { status: dm.recipient?.source === 'local' ? state.online.has(dm.recipient.id) : undefined }),
               h('span', { className: 'name' }, dm.name),
+              voiceCount(dm.id) > 0 && h('span', { className: 'in-call', title: 'Anruf läuft' }, '📞'),
               dm.recipient?.source === 'discord' && h('span', { className: 'badge discord' }, 'Discord'),
             ),
           )
@@ -327,10 +385,52 @@ function renderSidebar() {
       ? h('div', { className: 'server-info' }, h('span', {}, h('span', { className: 'badge discord' }, 'Discord'), ' Dieser Server ist mit Discord verbunden. Nachrichten erscheinen dort mit „(D2)“ hinter deinem Namen.'))
       : server.inviteCode && h('div', { className: 'server-info' }, h('span', { className: 'muted' }, 'Einladungscode für Freunde:'), h('code', {}, server.inviteCode)),
     h('div', { className: 'sidebar-section' }, 'Textkanäle'),
-    state.channels.map((channel) =>
-      h('button', { className: itemClass(channel), onclick: () => openChannel(channel) }, h('span', { className: 'hash' }, '#'), h('span', { className: 'name' }, channel.name)),
-    ),
+    state.channels
+      .filter((c) => c.type === 'text')
+      .map((channel) =>
+        h('button', { className: itemClass(channel), onclick: () => openChannel(channel) }, h('span', { className: 'hash' }, '#'), h('span', { className: 'name' }, channel.name)),
+      ),
+    state.channels.some((c) => c.type === 'voice') && h('div', { className: 'sidebar-section' }, 'Sprachkanäle'),
+    state.channels
+      .filter((c) => c.type === 'voice')
+      .map((channel) => [
+        h(
+          'button',
+          { className: itemClass(channel), onclick: () => openVoiceChannel(channel), title: 'Beitreten' },
+          h('span', { className: 'hash' }, '🔊'),
+          h('span', { className: 'name' }, channel.name),
+        ),
+        voiceMembersList(channel.id),
+      ]),
     !server.isOwner && h('button', { className: 'list-item', style: 'margin-top: 16px', onclick: () => leaveServer(server) }, h('span', { className: 'hash' }, '⎋'), h('span', { className: 'name' }, 'Server verlassen')),
+  );
+}
+
+function voiceCount(channelId) {
+  const st = state.voiceStates.get(channelId);
+  return st ? st.participants.length + st.discord.length : 0;
+}
+
+// Wer in einem Sprachkanal ist, direkt unter dem Kanal (wie bei Discord).
+function voiceMembersList(channelId) {
+  const st = state.voiceStates.get(channelId);
+  if (!st || !(st.participants.length + st.discord.length)) return null;
+  return h(
+    'div',
+    { className: 'voice-members' },
+    st.participants.map((p) =>
+      h(
+        'div',
+        { className: 'voice-member', 'data-voice-key': p.socketId },
+        avatar(p.user),
+        h('span', { className: 'name' }, p.user.username),
+        (p.video || p.screen) && h('span', { title: p.screen ? 'Teilt den Bildschirm' : 'Kamera an' }, p.screen ? '🖥' : '📷'),
+        p.muted && h('span', { title: 'Stumm' }, '🔇'),
+      ),
+    ),
+    st.discord.map((m) =>
+      h('div', { className: 'voice-member' }, avatar(m), h('span', { className: 'name' }, m.username), h('span', { className: 'badge discord' }, 'Discord'), m.muted && h('span', {}, '🔇')),
+    ),
   );
 }
 
@@ -416,9 +516,11 @@ async function openChannel(channel) {
   $('#app').classList.remove('nav-open');
   renderSidebar();
 
+  renderStage();
   if (!channel) {
     $('#chat-title').textContent = '';
     $('#chat-bridged').hidden = true;
+    $('#call-button').hidden = true;
     $('#composer').hidden = true;
     $('#messages').replaceChildren($('#empty-state') ?? emptyState());
     return;
@@ -428,8 +530,15 @@ async function openChannel(channel) {
   renderServers();
   renderSidebar();
   const isDm = channel.type === 'dm';
-  $('#chat-title').textContent = isDm ? `@${channel.name}` : `# ${channel.name}`;
+  $('#chat-title').textContent = isDm ? `@${channel.name}` : channel.type === 'voice' ? `🔊 ${channel.name}` : `# ${channel.name}`;
   $('#chat-bridged').hidden = !(channel.bridged || channel.recipient?.source === 'discord');
+  $('#call-button').hidden = !(isDm && channel.recipient?.source === 'local');
+  if (channel.type === 'voice') {
+    $('#composer').hidden = true;
+    $('#messages').hidden = true;
+    return;
+  }
+  $('#messages').hidden = false;
   $('#composer').hidden = false;
   input.value = '';
   autoGrow();
@@ -703,6 +812,7 @@ async function openDiscoverDialog() {
   try {
     const { servers, discord } = await api('/servers/discover');
     state.discord = discord;
+    const own = await ownDiscordServers(discord);
     const status = !discord.enabled
       ? h('div', { className: 'callout' }, 'Die Discord-Brücke ist auf diesem Server nicht eingerichtet. Der Betreiber muss DISCORD_BOT_TOKEN setzen (siehe README).')
       : !discord.ready
@@ -710,8 +820,10 @@ async function openDiscoverDialog() {
         : null;
     openModal(
       h('h2', {}, 'Discord-Server entdecken'),
-      h('p', { className: 'muted', style: 'text-align: center' }, 'Diese echten Discord-Server sind mit Discord 2.0 verbunden. Tritt bei und chatte mit den Leuten dort.'),
       status,
+      own,
+      h('h3', {}, 'Verbundene Discord-Server'),
+      h('p', { className: 'muted small' }, 'Diese echten Discord-Server sind mit Discord 2.0 verbunden. Tritt bei, um dort zu schreiben und in Sprachkanälen mitzureden.'),
       servers.length
         ? h(
             'div',
@@ -729,17 +841,76 @@ async function openDiscoverDialog() {
             ),
           )
         : discord.ready && h('p', { className: 'muted', style: 'text-align: center' }, 'Noch keine Discord-Server verbunden.'),
-      discord.inviteUrl &&
+      (discord.inviteUrl || discord.userInstallUrl) &&
         h(
           'div',
           { className: 'callout' },
-          h('strong', {}, 'Dein Discord-Server fehlt? '),
-          'Lade den Brücken-Bot ein (du brauchst dort die Berechtigung „Server verwalten“): ',
-          h('a', { href: discord.inviteUrl, target: '_blank', rel: 'noopener noreferrer' }, 'Bot zu Discord hinzufügen'),
+          h('strong', {}, 'Bot hinzufügen'),
+          h(
+            'ul',
+            { className: 'link-list' },
+            discord.inviteUrl &&
+              h('li', {}, h('a', { href: discord.inviteUrl, target: '_blank', rel: 'noopener noreferrer' }, 'Zu einem Discord-Server hinzufügen'), ' – dafür brauchst du dort „Server verwalten“.'),
+            discord.userInstallUrl &&
+              h(
+                'li',
+                {},
+                h('a', { href: discord.userInstallUrl, target: '_blank', rel: 'noopener noreferrer' }, 'Zu deinem eigenen Discord-Konto hinzufügen'),
+                ' – dann kannst du überall auf Discord /discord2 benutzen.',
+              ),
+          ),
         ),
     );
   } catch (err) {
     openModal(h('h2', {}, 'Discord-Server entdecken'), h('p', { className: 'error' }, err.message));
+  }
+}
+
+// "Deine Discord-Server" – nur mit verknüpftem Discord-Konto.
+async function ownDiscordServers(discord) {
+  if (!discord.login) return null;
+  if (!state.user.discordLinked) {
+    return h(
+      'div',
+      { className: 'callout' },
+      h('strong', {}, 'Deine Discord-Server hier sehen? '),
+      'Verbinde dein Discord-Konto. Dann siehst du alle deine Server und kannst den Bot mit einem Klick hinzufügen. ',
+      h('button', { className: 'primary', style: 'margin-top: 8px', onclick: linkDiscord }, 'Discord verbinden'),
+    );
+  }
+  try {
+    const guilds = await api('/discord/guilds');
+    return [
+      h('h3', {}, 'Deine Discord-Server'),
+      h(
+        'div',
+        { className: 'card-list' },
+        guilds.map((guild) =>
+          h(
+            'div',
+            { className: 'card' },
+            avatar({ avatar: guild.iconUrl, username: guild.name }, { large: true }),
+            h('div', { className: 'name' }, h('strong', {}, guild.name), h('span', { className: 'muted small' }, guild.serverId ? 'Verbunden' : guild.canManage ? 'Bot noch nicht dabei' : 'Ein Admin muss den Bot hinzufügen')),
+            guild.serverId
+              ? guild.joined
+                ? h('button', { className: 'secondary', onclick: () => { closeModal(); selectView(guild.serverId); } }, 'Öffnen')
+                : h('button', { className: 'primary', onclick: () => joinBridged(guild.serverId) }, 'Beitreten')
+              : guild.inviteUrl && h('a', { className: 'primary button-link', href: guild.inviteUrl, target: '_blank', rel: 'noopener noreferrer' }, 'Bot hinzufügen'),
+          ),
+        ),
+      ),
+    ];
+  } catch (err) {
+    return h('p', { className: 'error' }, `Deine Discord-Server konnten nicht geladen werden: ${err.message}`);
+  }
+}
+
+async function linkDiscord() {
+  try {
+    const { url } = await api('/discord/link', { method: 'POST' });
+    location.href = url;
+  } catch (err) {
+    toast(err.message, true);
   }
 }
 
@@ -755,16 +926,26 @@ async function joinBridged(serverId) {
 }
 
 function openCreateChannelDialog() {
+  const type = h(
+    'div',
+    { className: 'type-choice' },
+    h('label', {}, h('input', { type: 'radio', name: 'channel-type', value: 'text', checked: true }), ' # Text'),
+    h('label', {}, h('input', { type: 'radio', name: 'channel-type', value: 'voice' }), ' 🔊 Sprache'),
+  );
   openModal(
     h('h2', {}, 'Kanal erstellen'),
+    type,
     ...inlineForm({
       placeholder: 'neuer-kanal',
       button: 'Erstellen',
       onsubmit: async (name) => {
-        const channel = await api(`/servers/${state.view}/channels`, { method: 'POST', body: { name } });
+        const channelType = type.querySelector('input:checked').value;
+        const channel = await api(`/servers/${state.view}/channels`, { method: 'POST', body: { name, type: channelType } });
         closeModal();
         await loadChannels();
-        openChannel(state.channels.find((c) => c.id === channel.id));
+        const created = state.channels.find((c) => c.id === channel.id);
+        if (created.type === 'voice') openVoiceChannel(created);
+        else openChannel(created);
       },
     }),
   );
@@ -841,6 +1022,184 @@ async function startDm(target) {
   }
 }
 
+// ---------- Anrufe & Sprachkanäle ----------
+
+function onVoiceState(st) {
+  state.voiceStates.set(st.channelId, st);
+  const visible = state.view === 'home' ? state.dms.some((d) => d.id === st.channelId) : state.channels.some((c) => c.id === st.channelId);
+  if (visible) renderSidebar();
+  if (state.channel?.id === st.channelId || voice.channelId === st.channelId) renderStage();
+}
+
+async function joinCall(channelId) {
+  try {
+    await voice.join(channelId);
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+function openVoiceChannel(channel) {
+  openChannel(channel);
+  if (voice.channelId !== channel.id) joinCall(channel.id);
+}
+
+$('#call-button').addEventListener('click', () => {
+  if (state.channel && voice.channelId !== state.channel.id) joinCall(state.channel.id);
+});
+
+function onRing({ channelId, from }) {
+  if (voice.channelId === channelId) return;
+  state.ringing = channelId;
+  openModal(
+    h('div', { className: 'ring' }, avatar(from, { large: true }), h('h2', {}, `${from.username} ruft dich an`)),
+    h(
+      'div',
+      { className: 'ring-actions' },
+      h('button', { className: 'danger', onclick: () => { socket.emit('voice:decline', { channelId }); state.ringing = null; closeModal(); } }, 'Ablehnen'),
+      h(
+        'button',
+        {
+          className: 'success',
+          onclick: async () => {
+            state.ringing = null;
+            closeModal();
+            if (state.view !== 'home') await selectView('home');
+            await openChannel(state.dms.find((d) => d.id === channelId) ?? (await loadDms(), state.dms.find((d) => d.id === channelId)));
+            joinCall(channelId);
+          },
+        },
+        'Annehmen',
+      ),
+    ),
+  );
+}
+
+function channelName(channelId) {
+  const channel = state.channels.find((c) => c.id === channelId) ?? state.dms.find((d) => d.id === channelId);
+  if (!channel) return 'Anruf';
+  return channel.type === 'dm' ? `@${channel.name}` : `🔊 ${channel.name}`;
+}
+
+function renderVoicePanel() {
+  const panel = $('#voice-panel');
+  panel.hidden = !voice.connected;
+  if (!voice.connected) return;
+  const button = (label, title, onclick, active = false, extra = '') =>
+    h('button', { className: `icon-button${active ? ' active' : ''}${extra}`, title, onclick }, label);
+  const wrap = (fn) => () => fn().catch((err) => toast(err.message, true));
+  fill(
+    panel,
+    h(
+      'div',
+      { className: 'voice-status' },
+      h('strong', {}, voice.bridged ? 'Mit Discord verbunden' : 'Sprachverbindung'),
+      h('button', { className: 'link', onclick: () => jumpToCall() }, channelName(voice.channelId)),
+    ),
+    h(
+      'div',
+      { className: 'voice-controls' },
+      button(voice.muted ? '🔇' : '🎙', voice.muted ? 'Stummschaltung aufheben' : 'Stummschalten', () => voice.setMuted(!voice.muted), voice.muted),
+      button(voice.deafened ? '🙉' : '🎧', voice.deafened ? 'Wieder hören' : 'Ton aus', () => voice.setDeafened(!voice.deafened), voice.deafened),
+      button('📷', voice.cameraTrack ? 'Kamera aus' : 'Kamera an', wrap(() => voice.toggleCamera()), Boolean(voice.cameraTrack)),
+      button('🖥', voice.screenTrack ? 'Bildschirm nicht mehr teilen' : 'Bildschirm teilen', wrap(() => voice.toggleScreen()), Boolean(voice.screenTrack)),
+      button('✆', 'Auflegen', () => voice.leave(), false, ' hangup'),
+    ),
+  );
+}
+
+async function jumpToCall() {
+  const channelId = voice.channelId;
+  const dm = state.dms.find((d) => d.id === channelId);
+  if (dm) {
+    if (state.view !== 'home') await selectView('home');
+    return openChannel(dm);
+  }
+  const channel = state.channels.find((c) => c.id === channelId);
+  if (channel) openChannel(channel);
+}
+
+function tile({ key, person, label, video, speaking, muted, discord }) {
+  const el = h(
+    'div',
+    { className: `tile${speaking ? ' speaking' : ''}`, 'data-voice-key': key },
+    video ? video : avatar(person, { large: true }),
+    h('div', { className: 'tile-label' }, label, discord && h('span', { className: 'badge discord' }, 'Discord'), muted && ' 🔇'),
+  );
+  return el;
+}
+
+function videoElement(stream, mirrored = false) {
+  const el = h('video', { autoplay: true, playsinline: true, className: mirrored ? 'mirrored' : '' });
+  el.muted = true;
+  el.srcObject = stream;
+  return el;
+}
+
+// Anruffläche: für Sprachkanäle im ganzen Chatbereich, bei DMs oberhalb der Nachrichten.
+function renderStage() {
+  const stage = $('#call-stage');
+  const channel = state.channel;
+  const st = channel ? state.voiceStates.get(channel.id) : null;
+  const inThisCall = channel && voice.channelId === channel.id;
+  const show = channel && (channel.type === 'voice' || inThisCall || (channel.type === 'dm' && st?.participants.length));
+  stage.hidden = !show;
+  stage.classList.toggle('full', channel?.type === 'voice');
+  if (!show) return stage.replaceChildren();
+
+  if (!inThisCall) {
+    const people = [...(st?.participants ?? []).map((p) => p.user), ...(st?.discord ?? [])];
+    return fill(
+      stage,
+      h(
+        'div',
+        { className: 'stage-idle' },
+        h('div', { className: 'stage-avatars' }, people.slice(0, 8).map((p) => avatar(p, { large: true }))),
+        h('p', {}, people.length ? `${people.length} ${people.length === 1 ? 'Person ist' : 'Personen sind'} hier` : 'Noch niemand hier'),
+        h('button', { className: 'success', onclick: () => joinCall(channel.id) }, channel.type === 'dm' ? 'Anruf beitreten' : 'Beitreten'),
+      ),
+    );
+  }
+
+  const media = new Map((st?.participants ?? []).map((p) => [p.socketId, p]));
+  const tiles = [
+    tile({
+      key: 'me',
+      person: state.user,
+      label: `${state.user.username} (du)`,
+      video: voice.videoTrack && videoElement(new MediaStream([voice.videoTrack]), Boolean(voice.cameraTrack) && !voice.screenTrack),
+      speaking: voice.localSpeaking,
+      muted: voice.muted,
+    }),
+    ...[...voice.peers].map(([socketId, peer]) => {
+      const info = media.get(socketId);
+      const hasVideo = (info?.video || info?.screen) && peer.stream.getVideoTracks().length;
+      return tile({ key: socketId, person: peer.user, label: peer.user.username, video: hasVideo && videoElement(peer.stream), speaking: peer.speaking, muted: info?.muted });
+    }),
+    ...(st?.discord ?? []).map((m) => tile({ key: `discord:${m.id}`, person: m, label: m.username, muted: m.muted, discord: true })),
+  ];
+  fill(
+    stage,
+    h('div', { className: 'tiles' }, tiles),
+    channel.type === 'dm' && voice.peers.size === 0 && h('p', { className: 'muted stage-hint' }, `Warte auf ${channel.name} …`),
+  );
+}
+
+// Sprechanzeige ohne alles neu aufzubauen.
+function updateSpeaking() {
+  for (const el of document.querySelectorAll('[data-voice-key]')) {
+    const key = el.dataset.voiceKey;
+    const speaking = key === 'me' || key === socket?.id ? voice.localSpeaking : voice.peers.get(key)?.speaking;
+    el.classList.toggle('speaking', Boolean(speaking));
+  }
+}
+
+voice.addEventListener('change', () => {
+  renderVoicePanel();
+  renderStage();
+});
+voice.addEventListener('speaking', updateSpeaking);
+
 // ---------- Los geht's ----------
 
 document.addEventListener('visibilitychange', () => {
@@ -850,8 +1209,17 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
+const redirect = readRedirectHash();
+showDiscordLogin();
+if (redirect.error) {
+  $('#auth-error').textContent = redirect.error;
+  $('#auth-error').hidden = false;
+}
+
 if (state.token) {
-  start().catch(() => showAuth());
+  start()
+    .then(() => redirect.linked && toast('Dein Discord-Konto ist jetzt verbunden'))
+    .catch(() => showAuth());
 } else {
   showAuth();
 }

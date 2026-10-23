@@ -16,6 +16,11 @@
         <label>Passwort <input name="password" type="password" autocomplete="current-password" required minlength="6" /></label>
         <p class="error" id="auth-error" hidden></p>
         <button type="submit" class="primary" id="auth-submit">Anmelden</button>
+        <div class="auth-divider" id="discord-login-divider" hidden><span>oder</span></div>
+        <a class="discord-login" id="discord-login" href="/auth/discord" hidden>
+          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M19.3 5.3A17 17 0 0 0 15 4l-.5 1a15.6 15.6 0 0 0-5 0L9 4a17 17 0 0 0-4.3 1.3C2 9.4 1.2 13.4 1.6 17.3A17.2 17.2 0 0 0 6.8 20l1.1-1.8c-.6-.2-1.2-.5-1.8-.9l.4-.3a12.3 12.3 0 0 0 11 0l.4.3c-.6.4-1.2.7-1.8.9l1.1 1.8a17.1 17.1 0 0 0 5.2-2.7c.5-4.5-.8-8.5-3.1-12ZM8.5 14.9c-1 0-1.9-1-1.9-2.2s.8-2.2 1.9-2.2 1.9 1 1.9 2.2-.8 2.2-1.9 2.2Zm7 0c-1 0-1.9-1-1.9-2.2s.8-2.2 1.9-2.2 1.9 1 1.9 2.2-.8 2.2-1.9 2.2Z"/></svg>
+          Mit Discord anmelden
+        </a>
         <p class="muted small">
           <span id="auth-switch-text">Noch kein Konto?</span>
           <button type="button" class="link" id="auth-switch">Registrieren</button>
@@ -43,6 +48,7 @@
           <button class="icon-button" id="sidebar-action" title="Neue Nachricht">+</button>
         </header>
         <div class="sidebar-body" id="sidebar-list"></div>
+        <section class="voice-panel" id="voice-panel" hidden></section>
         <footer class="user-panel">
           <span class="avatar" id="me-avatar"></span>
           <span class="user-panel-name" id="me-name"></span>
@@ -56,8 +62,10 @@
           <span class="chat-title" id="chat-title"></span>
           <span class="badge discord" id="chat-bridged" hidden>über Discord</span>
           <span class="spacer"></span>
+          <button class="icon-button" id="call-button" title="Anruf starten" hidden>📞</button>
           <button class="icon-button" id="members-toggle" title="Mitgliederliste" hidden>👥</button>
         </header>
+        <section class="call-stage" id="call-stage" hidden></section>
         <div class="messages" id="messages">
           <div class="empty" id="empty-state">
             <h2>Hi! 👋</h2>

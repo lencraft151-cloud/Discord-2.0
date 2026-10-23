@@ -99,6 +99,7 @@ export function createChat({ store, io }) {
     setBridge(b) {
       bridge = b;
     },
+    emitToChannel,
     sendMessage,
     receiveFromDiscord,
     messageUpdated,

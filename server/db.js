@@ -6,7 +6,7 @@ const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
   id            INTEGER PRIMARY KEY,
   username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
-  password_hash TEXT NOT NULL,
+  password_hash TEXT NOT NULL, -- leer bei Konten, die nur per Discord angemeldet werden
   color         TEXT NOT NULL,
   created_at    INTEGER NOT NULL
 );
@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS members (
   PRIMARY KEY (server_id, user_id)
 );
 
--- type 'text' gehört zu einem Server, type 'dm' ist eine Direktnachricht.
+-- type 'text'/'voice' gehört zu einem Server, type 'dm' ist eine Direktnachricht.
 -- Eine DM mit discord_user_id ist ein Gespräch mit einem echten Discord-Nutzer.
 CREATE TABLE IF NOT EXISTS channels (
   id                 INTEGER PRIMARY KEY,
@@ -85,11 +85,30 @@ CREATE TABLE IF NOT EXISTS discord_dm_last (
 );
 `;
 
+// Spalten, die nach der ersten Version dazugekommen sind. Werden bei älteren
+// Datenbanken automatisch ergänzt.
+const ADDED_COLUMNS = [
+  ['users', 'discord_id', 'TEXT'],
+  ['users', 'avatar_url', 'TEXT'],
+  ['users', 'discord_access_token', 'TEXT'],
+  ['users', 'discord_refresh_token', 'TEXT'],
+  ['users', 'discord_token_expires', 'INTEGER'],
+];
+
+function migrate(db) {
+  for (const [table, column, type] of ADDED_COLUMNS) {
+    const exists = db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === column);
+    if (!exists) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  }
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS users_discord_id ON users(discord_id)');
+}
+
 export function openDatabase(file) {
   if (file !== ':memory:') mkdirSync(dirname(file), { recursive: true });
   const db = new DatabaseSync(file);
   db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
   db.exec(SCHEMA);
+  migrate(db);
   return db;
 }
 

@@ -59,7 +59,9 @@ test('Registrierung und Anmeldung', async () => {
   assert.equal(login.status, 200);
   const me = await call('/me', { token: login.data.token });
   assert.equal(me.data.user.username, 'anna');
-  assert.deepEqual(me.data.discord, { enabled: false, ready: false, inviteUrl: null });
+  assert.equal(me.data.discord.enabled, false);
+  assert.equal(me.data.discord.login, false);
+  assert.ok(Array.isArray(me.data.iceServers));
 
   assert.equal((await call('/me')).status, 401);
 });
